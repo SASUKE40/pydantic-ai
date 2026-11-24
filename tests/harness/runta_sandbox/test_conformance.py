@@ -26,7 +26,8 @@ def _attach(ref: WorkspaceRef) -> WorkspaceBackend:
     return RuntaSandboxBackend(ref=ref)
 
 
-async def _delete(backend: WorkspaceBackend) -> None:
+# Only the live tier's destructive rules delete a runtime.
+async def _delete(backend: WorkspaceBackend) -> None:  # pragma: no cover
     assert backend.ref is not None
     await RuntaSandbox[None]().destroy(backend.ref)
 

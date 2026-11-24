@@ -5,10 +5,10 @@ The backend's own client runs unchanged: `FakeRunta.handle` stands in for the HT
 run for real, in a local subprocess started in `FakeRunta.root`, so they share one host directory and
 deadlines are real.
 
-It follows what the live API was measured to do (2026-11-23): a runtime path takes a UUID only, a
-create repeated with the same `Idempotency-Key` returns the same runtime, the exec handshake is
-refused with an HTTP status unless the runtime is running, closing the socket kills a command that is
-still running, and a process ended by a signal reports exit code -1.
+It follows what the live API was measured to do (2026-11-23): a runtime is addressed by its UUID, a
+lifecycle call needs the runtime's current revision and returns before the change lands, the exec
+handshake is refused with an HTTP status unless the runtime is running, closing the socket kills a
+command that is still running, and a process ended by a signal reports exit code -1.
 """
 
 from __future__ import annotations
@@ -41,14 +41,22 @@ class FakeRuntime:
     resources: dict[str, object] = field(default_factory=dict[str, object])
 
 
-class FakeExecSocket:
-    """One exec WebSocket, from the start frame to the exit frame."""
+class FakeExecSocket(asyncio.SubprocessProtocol):
+    """One exec WebSocket, from the start frame to the exit frame.
+
+    It is also its command's subprocess protocol. On Python 3.11 and 3.12, `Process.wait()` returns only
+    once the output pipes close, and a background child can hold them open, so the command's exit is
+    taken from `process_exited` instead.
+    """
 
     def __init__(self, fake: FakeRunta, runtime: FakeRuntime) -> None:
         self._fake = fake
         self._runtime = runtime
         self._frames: asyncio.Queue[str | None] = asyncio.Queue()
-        self._process: asyncio.subprocess.Process | None = None
+        self._transport: asyncio.SubprocessTransport | None = None
+        self._exited = asyncio.Event()
+        self._drained = asyncio.Event()
+        self._open_pipes = 2
         self._tasks: list[asyncio.Task[None]] = []
         self.closed = False
 
@@ -60,7 +68,8 @@ class FakeExecSocket:
             for injected in ('{"type": "heartbeat"}', *self._fake.frames_next):
                 self._frames.put_nowait(injected)
             self._fake.frames_next = []
-            self._process = await asyncio.create_subprocess_exec(
+            self._transport, _ = await asyncio.get_running_loop().subprocess_exec(
+                lambda: self,
                 frame['command'],
                 *frame['args'],
                 cwd=self._fake.root,
@@ -71,24 +80,31 @@ class FakeExecSocket:
                 # Its own process group, so closing the socket can end the command and its children.
                 start_new_session=True,
             )
-            self._tasks.append(asyncio.create_task(self._serve(self._process)))
+            self._tasks.append(asyncio.create_task(self._serve(self._transport)))
 
-    async def _pump(self, kind: str, stream: asyncio.StreamReader) -> None:
-        while chunk := await stream.read(65536):
-            self._frames.put_nowait(json.dumps({'type': kind, 'data_base64': base64.b64encode(chunk).decode()}))
+    def pipe_data_received(self, fd: int, data: bytes) -> None:
+        kind = 'stdout' if fd == 1 else 'stderr'
+        self._frames.put_nowait(json.dumps({'type': kind, 'data_base64': base64.b64encode(data).decode()}))
 
-    async def _serve(self, process: asyncio.subprocess.Process) -> None:
-        assert process.stdout is not None and process.stderr is not None
-        pumps = [
-            asyncio.create_task(self._pump('stdout', process.stdout)),
-            asyncio.create_task(self._pump('stderr', process.stderr)),
-        ]
-        code = await process.wait()
+    def pipe_connection_lost(self, fd: int, exc: Exception | None) -> None:
+        del fd, exc
+        self._open_pipes -= 1
+        if not self._open_pipes:
+            self._drained.set()
+
+    def process_exited(self) -> None:
+        self._exited.set()
+
+    async def _serve(self, transport: asyncio.SubprocessTransport) -> None:
+        await self._exited.wait()
         # A background child can keep the pipes open: report the exit after a short drain.
-        # real-wait: a child that outlives the command holds the pipes open, so only the clock ends the drain
-        _, pending = await asyncio.wait(pumps, timeout=_DRAIN_GRACE)
-        for pump in pending:
-            pump.cancel()
+        try:
+            # real-wait: a child that outlives the command holds the pipes open, so only the clock ends the drain
+            await asyncio.wait_for(self._drained.wait(), timeout=_DRAIN_GRACE)
+        except TimeoutError:
+            pass
+        code = transport.get_returncode()
+        assert code is not None
         if self._fake.drop_exit:
             if self._fake.lost_runtime_status == 'deleted':
                 self._fake.runtimes.pop(self._runtime.id, None)
@@ -116,15 +132,17 @@ class FakeExecSocket:
 
     async def close(self) -> None:
         self.closed = True
-        process = self._process
-        if process is not None and process.returncode is None:
+        transport = self._transport
+        assert transport is not None
+        if transport.get_returncode() is None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(transport.get_pid(), signal.SIGKILL)
             # The command exited as the socket closed.
             except (ProcessLookupError, PermissionError):  # pragma: no cover
                 pass
         for task in self._tasks:
             await asyncio.wait([task])
+        transport.close()
 
 
 class FakeRunta:
@@ -158,7 +176,6 @@ class FakeRunta:
         self.delete_on_wake = False
         # Statuses queued for the next REST answers, oldest first.
         self.fail_next: list[int] = []
-        self._keys: dict[str, str] = {}
 
     def create(self, name: str = 'existing', *, status: str = 'running') -> FakeRuntime:
         runtime = FakeRuntime(id=str(uuid.uuid4()), name=name, status=status)
@@ -182,10 +199,7 @@ class FakeRunta:
         parts = request.url.path.strip('/').split('/')[2:]
         if not parts:
             return self._create(request)
-        try:
-            runtime_id = str(uuid.UUID(parts[0]))
-        except ValueError:
-            return self._json(422, {'error': {'code': 'invalid_argument', 'message': 'runtime_id must be a UUID'}})
+        runtime_id = parts[0]
         runtime = self.runtimes.get(runtime_id)
         if runtime is None:
             return self._json(404, {'error': {'code': 'not_found', 'message': f'runtime {runtime_id} not found'}})
@@ -197,8 +211,8 @@ class FakeRunta:
             if runtime.status in ('creating', 'resuming'):
                 runtime.status = 'running'
             return response
-        if request.url.params.get('expected_revision') != str(runtime.revision):
-            return self._json(409, {'error': {'code': 'failed_precondition', 'message': 'stale revision'}})
+        # The live API answers 409 to a stale revision.
+        assert request.url.params.get('expected_revision') == str(runtime.revision)
         runtime.revision += 1
         if request.method == 'DELETE':
             del self.runtimes[runtime_id]
@@ -211,13 +225,12 @@ class FakeRunta:
 
     def _create(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        key = request.headers['Idempotency-Key']
-        if key not in self._keys:
-            runtime = self.create(body['name'], status=self.initial_status)
-            runtime.image = body.get('image', {}).get('id')
-            runtime.resources = body.get('resources', {})
-            self._keys[key] = runtime.id
-        return self._view(self.runtimes[self._keys[key]])
+        # The key is what makes a retried create return the same runtime on the live API.
+        assert request.headers['Idempotency-Key'] == body['name']
+        runtime = self.create(body['name'], status=self.initial_status)
+        runtime.image = body.get('image', {}).get('id')
+        runtime.resources = body.get('resources', {})
+        return self._view(runtime)
 
     async def connect(
         self, url: str, *, additional_headers: dict[str, str], open_timeout: float, max_size: int | None
@@ -226,8 +239,7 @@ class FakeRunta:
         runtime = self.runtimes.get(url.split('/')[-3])
         if self.refuse_next:
             raise InvalidStatus(Response(self.refuse_next.pop(0), 'Refused', Headers()))
-        if additional_headers.get('Authorization') != f'Bearer {self.token}':
-            raise InvalidStatus(Response(401, 'Unauthorized', Headers()))
+        assert additional_headers == {'Authorization': f'Bearer {self.token}'}
         if runtime is None:
             raise InvalidStatus(Response(404, 'Not Found', Headers()))
         if self.pause_before_next_exec:

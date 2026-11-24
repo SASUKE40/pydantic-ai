@@ -19,6 +19,7 @@ from pydantic_ai.workspaces import (
 )
 from pydantic_ai_harness.runta_sandbox import RuntaSandbox, RuntaSandboxBackend
 
+from .conftest import live_token
 from .fake_runta import FakeRunta
 
 pytestmark = [pytest.mark.anyio, pytest.mark.skipif(os.name != 'posix', reason='needs a POSIX host')]
@@ -107,6 +108,16 @@ class TestRuntaSandbox:
         assert await backend.working_dir() == os.path.realpath(directory)
         with pytest.raises(ValueError, match='illegal environment variable'):
             await backend.run(['true'], env={'a=b': 'x'})
+
+    async def test_a_program_whose_path_has_an_equals_sign_runs(self, runta: FakeRunta, tmp_path: Path):
+        del runta
+        program = tmp_path / 'tool=v1'
+        program.write_text('#!/bin/sh\necho "$0 ran with $1 and $KEPT"\n')
+        program.chmod(0o755)
+
+        result = await RuntaSandboxBackend(env={'KEPT': 'env'}).run([str(program), 'argument'])
+
+        assert result.stdout == f'{program} ran with argument and env\n'
 
     async def test_a_working_dir_that_cannot_be_created_or_is_missing_fails(self, runta: FakeRunta, tmp_path: Path):
         (tmp_path / 'file').write_text('x')
@@ -302,3 +313,23 @@ class TestRuntaSandbox:
             RuntaSandbox[None](working_dir='relative')
         with pytest.raises(ValueError, match='unsupported workspace provider'):
             RuntaSandboxBackend(ref=WorkspaceRef(provider='other', id='x'))
+
+
+@pytest.mark.parametrize(
+    ('env', 'outcome'),
+    [
+        ({'PYDANTIC_AI_HARNESS_RUNTA_LIVE': '1', 'RUNTA_TOKEN': 'token'}, 'run'),
+        ({'RUNTA_TOKEN': 'token'}, 'skip'),
+        ({'PYDANTIC_AI_HARNESS_RUNTA_LIVE': '1', 'RUNTA_REQUIRE_LIVE': '1'}, 'fail'),
+    ],
+)
+def test_live_tier_gate(monkeypatch: pytest.MonkeyPatch, env: dict[str, str], outcome: str) -> None:
+    for name in ('PYDANTIC_AI_HARNESS_RUNTA_LIVE', 'RUNTA_TOKEN', 'RUNTA_REQUIRE_LIVE'):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    if outcome == 'run':
+        assert live_token() == 'token'
+    else:
+        with pytest.raises(pytest.skip.Exception if outcome == 'skip' else pytest.fail.Exception):
+            live_token()

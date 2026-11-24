@@ -239,6 +239,11 @@ class RuntaSandboxBackend(WorkspaceBackend, SupportsCommands):
                 raise ValueError(
                     f'illegal environment variable {key!r}: a name is non-empty without "=" or NUL, a value without NUL'
                 )
+        argv = command_argv(command, shell)
+        if '=' in argv[0]:
+            # `env` reads an operand with `=` as an assignment, not as the program to run, so such a
+            # program is started by a shell that `env` runs.
+            argv = ['sh', '-c', 'exec "$@"', 'sh', *argv]
         # The POSIX `env` utility adds `variables` to the runtime's own environment. It runs inside the
         # wrapper: a `sh` such as dash drops variables whose names are not shell identifiers from the
         # environment it passes on. `--` ends its options, so a program or a name that starts with `-`
@@ -253,7 +258,7 @@ class RuntaSandboxBackend(WorkspaceBackend, SupportsCommands):
             'env',
             '--',
             *(f'{key}={value}' for key, value in variables.items()),
-            *command_argv(command, shell),
+            *argv,
         ]
         require_asyncio(_ASYNCIO_ONLY)
         async with open_client(self._token, self._endpoint) as client:
